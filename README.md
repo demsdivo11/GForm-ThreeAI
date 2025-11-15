@@ -15,7 +15,7 @@ Ekstensi Chrome/Chromium yang membantu menyalin struktur pertanyaan Google Form 
 ## Cara Instalasi
 1. **Unduh kode sumber**  
    ```sh
-   git clone https://github.com/username/GForm-ThreeAI.git
+   git clone https://github.com/demsdivo11/GForm-ThreeAI.git
    cd GForm-ThreeAI
    ```
    Atau download ZIP dari GitHub lalu ekstrak.
