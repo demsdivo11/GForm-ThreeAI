@@ -10,21 +10,27 @@ const modelSelect = document.getElementById('modelSelect');
 const aiSolveBtn = document.getElementById('aiSolveBtn');
 
 const PRESET_KEYS = {
-    aistudio: 'isi dengan apikey aistudio anda sendiri',
+    aistudio: 'AIzaSyC7tZFl4_G6KRpnO2HEM2WrNxo1LY1oBj4',
     openai: 'isi dengan apikey openai anda sendiri'
 };
 const KEY_STORAGE_KEY = 'gf_ai_keys';
+const LAST_RESULT_KEY = 'gf_last_result';
+const LAST_STATUS_KEY = 'gf_last_status';
+const LAST_MODEL_KEY = 'gf_last_model';
 const DEFAULT_PROVIDER = 'aistudio';
-const DEFAULT_GOOGLE_MODEL = 'text-bison-001';
+const DEFAULT_GOOGLE_MODEL = 'gemini-2.0-flash';
 let savedApiKeys = {};
 
 function setStatus(text) {
     statusEl.textContent = text;
+    if (chrome?.storage?.local) {
+        chrome.storage.local.set({ [LAST_STATUS_KEY]: text });
+    }
 }
 
 function getModelAndProvider() {
     const selectedOption = modelSelect.options[modelSelect.selectedIndex];
-    const model = selectedOption ? selectedOption.value : 'text-bison-001';
+    const model = selectedOption ? selectedOption.value : DEFAULT_GOOGLE_MODEL;
     const provider = (selectedOption && selectedOption.dataset && selectedOption.dataset.provider) || DEFAULT_PROVIDER;
     return { model, provider };
 }
@@ -97,13 +103,24 @@ solveBtn.addEventListener('click', () => {
 
 // load saved api key if any and merge with presets
 if (chrome && chrome.storage && chrome.storage.local) {
-    chrome.storage.local.get([KEY_STORAGE_KEY, 'gf_ai_key'], (res) => {
+    chrome.storage.local.get([KEY_STORAGE_KEY, 'gf_ai_key', LAST_RESULT_KEY, LAST_STATUS_KEY, LAST_MODEL_KEY], (res) => {
         if (res) {
             if (res[KEY_STORAGE_KEY] && typeof res[KEY_STORAGE_KEY] === 'object') {
                 savedApiKeys = res[KEY_STORAGE_KEY];
             }
             if (res.gf_ai_key && !savedApiKeys.aistudio) {
                 savedApiKeys.aistudio = res.gf_ai_key;
+            }
+            if (res[LAST_MODEL_KEY] && modelSelect.querySelector(`option[value="${res[LAST_MODEL_KEY]}"]`)) {
+                modelSelect.value = res[LAST_MODEL_KEY];
+            }
+            if (res[LAST_RESULT_KEY]) {
+                resultEl.textContent = res[LAST_RESULT_KEY];
+                resultEl.hidden = false;
+                resultActions.hidden = false;
+            }
+            if (res[LAST_STATUS_KEY]) {
+                statusEl.textContent = res[LAST_STATUS_KEY];
             }
         }
         refreshApiKeyInput();
@@ -114,6 +131,9 @@ if (chrome && chrome.storage && chrome.storage.local) {
 
 modelSelect.addEventListener('change', () => {
     refreshApiKeyInput();
+    if (chrome?.storage?.local) {
+        chrome.storage.local.set({ [LAST_MODEL_KEY]: modelSelect.value });
+    }
 });
 
 saveKeyCheckbox.addEventListener('change', () => {
@@ -195,9 +215,34 @@ aiSolveBtn.addEventListener('click', async () => {
 
                 if (suggestion) {
                     resultEl.textContent = suggestion;
+                    if (chrome?.storage?.local) {
+                        chrome.storage.local.set({ [LAST_RESULT_KEY]: suggestion });
+                    }
                     resultEl.hidden = false;
                     resultActions.hidden = false;
-                    setStatus(finalStatus);
+                    const { data: parsedSuggestions, error: parseError } = parseSuggestionJSON(suggestion);
+                    if (parsedSuggestions.length > 0) {
+                        setStatus(`${finalStatus} • menerapkan jawaban...`);
+                        chrome.scripting.executeScript(
+                            {
+                                target: { tabId: tabs[0].id },
+                                function: applySuggestionsToGoogleForm,
+                                args: [parsedSuggestions]
+                            },
+                            (applyResults) => {
+                                const res = applyResults && applyResults[0] && applyResults[0].result;
+                                if (Array.isArray(res)) {
+                                    const successCount = res.filter((r) => r && r.success).length;
+                                    setStatus(`${finalStatus} • ${successCount}/${res.length} opsi diklik`);
+                                } else {
+                                    setStatus(`${finalStatus} • Gagal menerapkan jawaban otomatis`);
+                                }
+                            }
+                        );
+                    } else {
+                        const errMsg = parseError ? ` (${parseError})` : '';
+                        setStatus(`${finalStatus} • JSON tidak terbaca${errMsg}, klik manual`);
+                    }
                 }
             } catch (err) {
                 console.error(err);
@@ -216,6 +261,9 @@ clearBtn.addEventListener('click', () => {
     resultEl.hidden = true;
     resultActions.hidden = true;
     setStatus('Bersih. Siap.');
+    if (chrome?.storage?.local) {
+        chrome.storage.local.remove([LAST_RESULT_KEY, LAST_STATUS_KEY]);
+    }
 });
 
 copyBtn.addEventListener('click', async () => {
@@ -266,8 +314,12 @@ async function callAI(formData, provider, modelName, apiKey) {
 
 function buildPrompt(formData) {
     const promptParts = [];
-    promptParts.push('Anda adalah asisten yang membantu memilih jawaban paling mungkin dari sebuah Google Form.');
-    promptParts.push('Berikan output sebagai JSON array. Untuk setiap pertanyaan, keluarkan objek {"question": ..., "suggestion": ..., "reason": ...}.');
+    promptParts.push('Anda adalah asisten yang memilih jawaban paling mungkin dari Google Form.');
+    promptParts.push('Output WAJIB berupa JSON array tanpa teks lain.');
+    promptParts.push('Gunakan penalaran dan hitung dengan teliti; pilih opsi yang paling benar, jangan asal.');
+    promptParts.push('Format setiap item: {"questionIndex": <nomor pertanyaan 1-based>, "optionNumber": <nomor opsi 1-based atau null jika tidak ada>, "optionText": "<teks opsi persis dari daftar>"}');
+    promptParts.push('Gunakan nomor pertanyaan dan nomor opsi sesuai yang diberikan di bawah (1-based). Jangan menebak label lain.');
+    promptParts.push('Jika tidak ada pilihan, set optionNumber ke null dan optionText ke "".');
     promptParts.push('Berikut daftar pertanyaan dan opsi:');
     formData.forEach((q, i) => {
         promptParts.push(`${i + 1}. ${q.question}`);
@@ -277,19 +329,25 @@ function buildPrompt(formData) {
             promptParts.push('   - (no choices)');
         }
     });
-    promptParts.push('Tolong pilih satu jawaban singkat (isi "suggestion" dengan teks opsi yang paling relevan).');
-    promptParts.push('Jawaban harus dalam format JSON hanya. Jangan sertakan penjelasan tambahan di luar JSON.');
+    promptParts.push('Hanya kembalikan JSON, tidak ada teks lain.');
     return promptParts.join('\n');
 }
 
 async function callAiStudio(promptText, apiKey, modelName) {
-    const model = modelName || 'text-bison-001';
-    const base = 'https://generativelanguage.googleapis.com/v1beta2/models/';
-    const endpoint = `${base}${encodeURIComponent(model)}:generateText?key=${encodeURIComponent(apiKey)}`;
+    const model = modelName || DEFAULT_GOOGLE_MODEL;
+    const base = 'https://generativelanguage.googleapis.com/v1/models/';
+    const endpoint = `${base}${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
     const body = {
-        prompt: { text: promptText },
-        temperature: 0.0,
-        maxOutputTokens: 512
+        contents: [
+            {
+                role: 'user',
+                parts: [{ text: promptText }]
+            }
+        ],
+        generationConfig: {
+            temperature: 0,
+            maxOutputTokens: 1024
+        }
     };
 
     const resp = await fetch(endpoint, {
@@ -305,12 +363,15 @@ async function callAiStudio(promptText, apiKey, modelName) {
 
     const json = await resp.json();
     let output = '';
-    if (json.candidates && json.candidates[0] && json.candidates[0].output) {
-        output = json.candidates[0].output;
-    } else if (json.result && json.result[0]) {
-        output = json.result[0];
-    } else if (json.candidates && json.candidates[0] && json.candidates[0].content) {
-        output = json.candidates[0].content;
+    if (json.candidates && json.candidates[0]) {
+        const candidate = json.candidates[0];
+        if (candidate.content && Array.isArray(candidate.content.parts)) {
+            output = candidate.content.parts.map((p) => p.text || p).join('');
+        } else if (candidate.output) {
+            output = candidate.output;
+        } else {
+            output = JSON.stringify(candidate, null, 2);
+        }
     } else {
         output = JSON.stringify(json, null, 2);
     }
@@ -365,6 +426,149 @@ function normalizeModelOutput(output) {
     }
 }
 
+function extractJsonArrayText(text) {
+    if (!text) return '';
+    let raw = String(text);
+    let start = raw.indexOf('[');
+    let end = raw.lastIndexOf(']');
+
+    // If no bracket found, strip code fences and try again
+    if (start === -1) {
+        raw = raw.replace(/```/g, '').replace(/^json\b/i, '').trim();
+        start = raw.indexOf('[');
+        end = raw.lastIndexOf(']');
+    }
+
+    // Best effort: slice from first [ to last ], or to end if missing ]
+    if (start !== -1) {
+        if (end !== -1 && end > start) {
+            return raw.slice(start, end + 1).trim();
+        }
+        return raw.slice(start).trim();
+    }
+
+    return raw.trim();
+}
+
+function parseSuggestionJSON(text) {
+    let extracted = extractJsonArrayText(text).replace(/```/g, '').replace(/^json\b/i, '').trim();
+    if (extracted.startsWith('[') && !extracted.trim().endsWith(']')) {
+        extracted = `${extracted}]`;
+    }
+    let lastErr = '';
+    const tryParse = (val) => {
+        try {
+            const parsed = JSON.parse(val);
+            if (Array.isArray(parsed)) return { data: parsed, error: '' };
+            return { data: [], error: 'Parsed but not array' };
+        } catch (err) {
+            lastErr = err.message;
+            return null;
+        }
+    };
+
+    const first = tryParse(extracted);
+    if (first) return first;
+
+    // fallback: remove trailing commas
+    const noTrailing = extracted.replace(/,(?=\s*[}\]])/g, '');
+    const second = tryParse(noTrailing);
+    if (second) return second;
+
+    // fallback: salvage any object literals found
+    const objectMatches = extracted.match(/\{[\s\S]*?\}/g) || [];
+    const salvaged = [];
+    objectMatches.forEach((objStr) => {
+        try {
+            const parsed = JSON.parse(objStr);
+            salvaged.push(parsed);
+        } catch (err) {
+            lastErr = err.message;
+        }
+    });
+    if (salvaged.length > 0) {
+        return { data: salvaged, error: '' };
+    }
+
+    console.error('Parse suggestion gagal', lastErr);
+    return { data: [], error: lastErr || 'Unknown parse error' };
+}
+
+function applySuggestionsToGoogleForm(suggestions) {
+    const questionElements = document.querySelectorAll('div[role="listitem"]');
+    const results = [];
+    const norm = (t) => (t || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+    const loose = (t) => (t || '').toString().toLowerCase().replace(/[^a-z0-9]/gi, '');
+    const isVisible = (el) => {
+        if (!el || typeof el.getBoundingClientRect !== 'function') return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    };
+    const isSkippableText = (txt) => {
+        const t = norm(txt);
+        return !t || t.includes('batal pilihan') || t.includes('clear selection');
+    };
+
+        suggestions.forEach((s, idx) => {
+            const qIndexRaw = s.questionIndex ?? s.index ?? s.no ?? s.questionNo ?? (idx + 1);
+            const qIndex = Number(qIndexRaw) - 1;
+            if (Number.isNaN(qIndex) || qIndex < 0 || qIndex >= questionElements.length) {
+                results.push({ success: false, message: 'Indeks pertanyaan tidak valid', questionIndex: qIndexRaw });
+                return;
+            }
+
+            const questionEl = questionElements[qIndex];
+            const rawOptionNodes = Array.from(
+                questionEl.querySelectorAll(
+                    'label, .docssharedWizToggleLabeledContainer, .freebirdFormviewerComponentsQuestionRadioChoice, div[role="radio"], div[role="checkbox"]'
+                )
+            );
+            const optionNodes = rawOptionNodes.filter((node) => isVisible(node) && !isSkippableText(node.innerText));
+
+            const optRaw = s.optionNumber ?? s.option ?? s.optionNo;
+            const optionNumber = optRaw === null ? null : Number(optRaw);
+            let targetNode = null;
+
+            if (optionNumber === null && !s.optionText) {
+                results.push({ success: true, questionIndex: qIndex + 1, message: 'Lewati (tidak ada opsi)' });
+                return;
+            }
+
+            if (optionNumber && !Number.isNaN(optionNumber) && optionNumber >= 1 && optionNumber <= optionNodes.length) {
+                targetNode = optionNodes[optionNumber - 1];
+            }
+
+            const desiredText = norm(s.optionText);
+            if (!targetNode && desiredText) {
+                targetNode =
+                    optionNodes.find((node) => {
+                        const text = norm(node.innerText || '');
+                        return text === desiredText || text.includes(desiredText) || desiredText.includes(text);
+                    }) ||
+                    optionNodes.find((node) => loose(node.innerText || '') === loose(desiredText));
+            }
+
+            // fallback to raw nodes if still not found (optionNumber reference might need unfiltered nodes)
+            if (!targetNode && optionNumber && optionNumber >= 1 && optionNumber <= rawOptionNodes.length) {
+                targetNode = rawOptionNodes[optionNumber - 1];
+            }
+
+            if (!targetNode) {
+                results.push({ success: false, message: 'Opsi tidak ditemukan', questionIndex: qIndex + 1 });
+                return;
+            }
+
+            const clickTarget =
+                targetNode.querySelector('input[type="radio"], input[type="checkbox"], div[role="radio"], div[role="checkbox"]') ||
+                targetNode;
+            clickTarget.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            clickTarget.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            results.push({ success: true, questionIndex: qIndex + 1 });
+        });
+
+        return results;
+    }
+
 function shouldFallbackToGoogle(provider, err) {
     if (provider !== 'openai' || !err) return false;
     const msg = (err.message || String(err || '')).toLowerCase();
@@ -379,7 +583,7 @@ async function attemptGoogleFallback(err, formData, provider) {
     if (!fallbackKey) {
         return { success: false, message: 'OpenAI quota habis dan kunci Google tidak tersedia.' };
     }
-    setStatus('OpenAI quota habis. Beralih ke Google text-bison-001...');
+    setStatus(`OpenAI quota habis. Beralih ke Google ${DEFAULT_GOOGLE_MODEL}...`);
     try {
         const suggestion = await callAI(formData, DEFAULT_PROVIDER, DEFAULT_GOOGLE_MODEL, fallbackKey);
         return { success: true, suggestion, status: 'Selesai (AI via Google)' };
