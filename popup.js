@@ -10,7 +10,7 @@ const modelSelect = document.getElementById('modelSelect');
 const aiSolveBtn = document.getElementById('aiSolveBtn');
 
 const PRESET_KEYS = {
-    aistudio: 'AIzaSyC7tZFl4_G6KRpnO2HEM2WrNxo1LY1oBj4',
+    aistudio: 'your key',
     openai: 'isi dengan apikey openai anda sendiri'
 };
 const KEY_STORAGE_KEY = 'gf_ai_keys';
